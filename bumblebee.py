@@ -5,6 +5,42 @@ from torch_geometric.loader import DataLoader
 from attention import SAB, PMA
 from molecule_dataset import MoleculeDataset
 
+
+def edge_adjacency(batched_edge_index):
+    N_e = batched_edge_index.size(1)
+    source_nodes = batched_edge_index[0]
+    target_nodes = batched_edge_index[1]
+
+    # unsqueeze and expand
+    exp_src = source_nodes.unsqueeze(1).expand(-1, N_e)
+    exp_trg = target_nodes.unsqueeze(1).expand(-1, N_e)
+
+    src_adj = exp_src == exp_src.T
+    trg_adj = exp_trg == exp_trg.T
+    cross = (exp_src == exp_trg.T) | (exp_trg == exp_src.T)
+
+    return src_adj | trg_adj | cross
+
+def edge_mask(b_ei, b_map, B, L):
+    mask = torch.full(size=(B, L, L), fill_value=False, dtype=torch.bool, device=b_ei.device)
+    edge_to_graph = b_map.index_select(0, b_ei[0, :])  # graph index for each edge
+
+    edge_adj = edge_adjacency(b_ei)
+
+    # Remap edge indices within each graph to consecutive indices 
+    # Step 1: Get unique graph indices (sorted), and for each edge its position in the per-graph consecutive list
+    unique_graphs, ei_to_original = torch.unique(edge_to_graph, sorted=True, return_inverse=True)
+    # ei_to_original is [num_edges], values in 0..(#unique_graphs-1) for each edge in b_ei
+
+    edges = edge_adj.nonzero(as_tuple=False)  # [num_connected_pairs, 2]
+    graph_index = edge_to_graph[edges[:, 0]]
+    coord_1 = ei_to_original[edges[:, 0]]
+    coord_2 = ei_to_original[edges[:, 1]]
+
+    mask[graph_index, coord_1, coord_2] = True
+    return ~mask
+
+
 class MAGClassifier(nn.Module):
 
     def __init__(self, node_dim, edge_dim, hidden_dim=128, num_heads=8, num_inds=32, output_dim=1):
@@ -36,6 +72,55 @@ class MAGClassifier(nn.Module):
         )
 
     def forward(self, data):
+        # Assume data is a torch_geometric.data.Batch object
+        x = data.x                  # [total_nodes, node_dim]
+        edge_index = data.edge_index # [2, total_edges]
+        edge_attr = data.edge_attr   # [total_edges, edge_dim]
+        batch = data.batch           # [total_nodes], maps node idx to graph idx
+
+        # Compute edge_batch: maps each edge to its graph in the batch
+        edge_batch = batch[edge_index[0]]   # [total_edges]
+
+        node_feat = self.node_encoder(x)                # [total_nodes, hidden_dim]
+        edge_feat = self.edge_encoder(edge_attr)        # [total_edges, hidden_dim]
+
+        src, dst = edge_index
+        edge_nodes = torch.cat([node_feat[src], node_feat[dst]], dim=1)  # [total_edges, 2*hidden_dim]
+        edge_repr = edge_nodes + torch.cat([edge_feat, edge_feat], dim=1)
+
+        B = batch.max().item() + 1
+        L = edge_repr.size(0)  # total number of edges
+
+        # === Build batch-wide edge mask ===
+        # b_map: [total_nodes], maps node idx to graph idx
+        # edge_index: [2, total_edges]
+        # edge_batch: [total_edges], maps edge idx to graph idx
+
+        # edge_mask will compute a [B, L, L] mask where only edges within same graph can attend
+        mask = edge_mask(edge_index, batch, B, L)  # [B, L, L]
+        mask = mask.unsqueeze(1)  # [B, 1, L, L] for multi-head attention
+
+        # SAB expects [batch, seq, feat], so expand edge_repr for batch dimension
+        # We'll need to pad edge_repr to (B, L, 2*hidden_dim) with zeros for missing edges per-graph
+        # But if all graphs have same number of edges or if you flatten, you can use [1, L, 2*hidden_dim]
+        edge_repr = edge_repr.unsqueeze(0)  # [1, L, 2*hidden_dim]
+        edge_repr = self.edge_attention1(edge_repr, adj_mask=mask)
+        edge_repr = self.edge_attention2(edge_repr, adj_mask=mask)
+        edge_repr = edge_repr.squeeze(0) # [L, 2*hidden_dim]
+
+        # PMA pooling per graph
+        # To pool per-graph, we need to group edge representations by edge_batch (graph id)
+        graph_embeds = []
+        for i in range(B):
+            edge_repr_g = edge_repr[edge_batch == i].unsqueeze(0)
+            graph_emb = self.pma(edge_repr_g, adj_mask=None)   # [1, 1, 2*hidden_dim]
+            graph_embeds.append(graph_emb.squeeze(0).squeeze(0))
+        graph_repr = torch.stack(graph_embeds, dim=0)    # [B, 2*hidden_dim]
+
+        logits = self.classifier(graph_repr)    # [B, output_dim]
+        return logits.view(-1)                  # [B]
+
+    def forward_old(self, data):
         # data: batch from DataLoader (torch_geometric.data.Batch)
         x = data.x                  # [total_nodes, node_dim]
         edge_index = data.edge_index # [2, total_edges]
@@ -77,11 +162,9 @@ class MAGClassifier(nn.Module):
             # src_dst: [num_edges, 2]
             src_nodes = src_dst[:, 0:1]  # [num_edges, 1]
             dst_nodes = src_dst[:, 1:2]  # [num_edges, 1]
-
             # Check for node sharing (broadcasting)
             shared_src = (src_nodes == src_nodes.T) | (src_nodes == dst_nodes.T)
             shared_dst = (dst_nodes == src_nodes.T) | (dst_nodes == dst_nodes.T)
-
             mask = shared_src | shared_dst  # [num_edges, num_edges]
 
             # # CPU version
@@ -92,6 +175,7 @@ class MAGClassifier(nn.Module):
             #             mask[i, j] = True
 
             mask = mask.unsqueeze(0).unsqueeze(1) # [1, 1, num_edges, num_edges]
+
 
             # SAB expects [batch, seq, feat]
             edge_repr_g = edge_repr_g.unsqueeze(0)
@@ -139,7 +223,7 @@ def train(model, loader, optimizer, criterion, epoch):
         total += batch.num_graphs
     return total_loss / total, correct / total
 
-def main():
+def main(): 
     dataset = MoleculeDataset('DATASETS/MUTA_SARPY_4204.csv')
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
     model = MAGClassifier(dataset.node_dim, dataset.edge_dim).to(DEVICE)
