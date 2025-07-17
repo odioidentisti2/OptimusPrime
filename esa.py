@@ -36,5 +36,4 @@ def edge_mask(b_ei, b_map, B, L):
     coord_2 = ei_to_original[edges[:, 1]]
 
     mask[graph_index, coord_1, coord_2] = True
-    mask = mask.unsqueeze(1)
     return ~mask
